@@ -1,0 +1,426 @@
+#include "fleet_controller/controller.hpp"
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <cmath>
+
+FleetController::FleetController() : Node("fleet_controller") {
+    // Inicjalizacja kolejki robotów
+    robot_bases.resize(NUM_ROBOTS, -1);
+    robots.resize(NUM_ROBOTS);
+
+    // Na początku wszystkie roboty są w kolejce
+    for (int i = 0; i < NUM_ROBOTS; ++i) {
+        robot_bases[i] = i;
+        robots[i].is_busy = false;
+        robots[i].state = RobotState::State::WAITING;
+	robots[i].movement_phase = 0;
+    }
+
+    // Publishers i subscribers dla każdego robota
+    for (int i = 0; i < NUM_ROBOTS; ++i) {
+        robot_publishers.push_back(
+            this->create_publisher<geometry_msgs::msg::Twist>(
+                "tb_" + std::to_string(i) + "/cmd_vel", 10));
+
+        auto odom_callback = [this, i](nav_msgs::msg::Odometry::SharedPtr msg) {
+            this->odom_callback(msg, i);
+        };
+
+        odom_subscribers.push_back(
+            this->create_subscription<nav_msgs::msg::Odometry>(
+                "tb_" + std::to_string(i) + "/odom", 10, odom_callback));
+    }
+
+    // Subskrypcja zadań
+    task_subscriber = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+        "new_task", 10,
+        std::bind(&FleetController::task_callback, this, std::placeholders::_1));
+
+    // Timer kontrolny (10Hz)
+    control_timer = this->create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&FleetController::control_loop, this));
+}
+
+void FleetController::task_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
+    if (msg->data.size() >= 2) {
+        Task new_task;
+        new_task.pickup_point = msg->data[0] - 1;  // Konwersja na indeks (0-9)
+        new_task.delivery_point = msg->data[1] - 1;
+        
+        if (new_task.pickup_point >= 0 && new_task.pickup_point < 10 &&
+            new_task.delivery_point >= 0 && new_task.delivery_point < 10) {
+            
+            new_task.pickup = pickup_stations[new_task.pickup_point];
+            new_task.delivery = delivery_stations[new_task.delivery_point];
+            task_queue.push(new_task);
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "New task added: pickup at point %d (%d,%d), delivery at point %d (%d,%d)",
+                new_task.pickup_point + 1, new_task.pickup.x, new_task.pickup.y,
+                new_task.delivery_point + 1, new_task.delivery.x, new_task.delivery.y);
+        }
+    }
+}
+
+void FleetController::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg, int robot_id) {
+    robots[robot_id].current_pose = msg->pose.pose;
+    robots[robot_id].current_position.x = msg->pose.pose.position.x;
+    robots[robot_id].current_position.y = msg->pose.pose.position.y;
+}
+
+double FleetController::get_robot_yaw(const geometry_msgs::msg::Pose& pose) {
+    tf2::Quaternion q;
+    q.setX(pose.orientation.x);
+    q.setY(pose.orientation.y);
+    q.setZ(pose.orientation.z);
+    q.setW(pose.orientation.w);
+    
+    double roll, pitch, yaw;
+    tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+
+    // Normalizacja do zakresu [-π, π]
+    while (yaw > M_PI) yaw -= 2 * M_PI;
+    while (yaw < -M_PI) yaw += 2 * M_PI;
+    
+    return yaw;
+}
+
+bool FleetController::is_point_reached(const Point2D& current, const Point2D& target) {
+    return (std::abs(current.x - target.x) < POSITION_TOLERANCE &&
+            std::abs(current.y - target.y) < POSITION_TOLERANCE);
+}
+
+Point2D FleetController::get_queue_position(int queue_position) {
+    return {-8, -8 + queue_position};  // Kolejka wzdłuż lewej ściany
+}
+
+int FleetController::find_first_empty_queue_position() {
+    for (int i = 0; i < NUM_ROBOTS; ++i) {
+        if (robot_bases[i] == -1) {
+            return i;
+        }
+    }
+    return -1;  // Nie znaleziono pustego miejsca
+}
+
+bool FleetController::rotate_robot(int robot_id, double target_angle) {
+    auto& robot = robots[robot_id];
+    geometry_msgs::msg::Twist cmd_vel;
+
+    // ZAWSZE zerujemy wszystkie prędkości na początku
+    cmd_vel.linear.x = 0.0;
+    cmd_vel.linear.y = 0.0;
+    cmd_vel.linear.z = 0.0;
+    cmd_vel.angular.x = 0.0;
+    cmd_vel.angular.y = 0.0;
+    cmd_vel.angular.z = 0.0;
+
+    // Pobierz aktualny kąt
+    double current_angle = get_robot_yaw(robot.current_pose);
+    
+    // Oblicz różnicę kątów
+    double angle_diff = target_angle - current_angle;
+    
+    // Normalizacja różnicy do zakresu [-π, π]
+    while (angle_diff > M_PI) angle_diff -= 2 * M_PI;
+    while (angle_diff < -M_PI) angle_diff += 2 * M_PI;
+
+    // Sprawdź czy cel osiągnięty
+    if (std::abs(angle_diff) < ANGLE_TOLERANCE) {
+        // Upewnij się, że robot jest zatrzymany
+        robot_publishers[robot_id]->publish(cmd_vel);
+        RCLCPP_INFO(this->get_logger(), 
+            "Robot %d reached target angle: %f", robot_id, target_angle);
+        return true;
+    }
+
+    // Ustaw TYLKO prędkość kątową, wszystkie inne zostają na 0
+    cmd_vel.angular.z = ANGULAR_SPEED * ((angle_diff > 0) ? 1.0 : -1.0);
+    
+    // Publikuj komendę
+    robot_publishers[robot_id]->publish(cmd_vel);
+    
+    RCLCPP_INFO(this->get_logger(), 
+        "Robot %d rotating. Current: %f, Target: %f, Diff: %f", 
+        robot_id, current_angle, target_angle, angle_diff);
+    return false;
+}
+
+bool FleetController::move_straight(int robot_id, const Point2D& target) {
+    auto& robot = robots[robot_id];
+    geometry_msgs::msg::Twist cmd_vel;
+
+    // Calculate distance to target
+    double dx = target.x - robot.current_position.x;
+    double dy = target.y - robot.current_position.y;
+    double distance = std::sqrt(dx * dx + dy * dy);
+    
+    // If we reached the target, stop and return
+    if (distance < POSITION_TOLERANCE) {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = 0.0;
+        robot_publishers[robot_id]->publish(cmd_vel);
+        return true;
+    }
+
+    // Calculate angle to target
+    double desired_angle = std::atan2(dy, dx);
+    double current_angle = get_robot_yaw(robot.current_pose);
+    
+    // Calculate angle difference (shortest path)
+    double angle_diff = desired_angle - current_angle;
+    if (angle_diff > M_PI) angle_diff -= 2 * M_PI;
+    if (angle_diff < -M_PI) angle_diff += 2 * M_PI;
+
+    // Proportional control for angular velocity
+    const double Kp_angular = 1.0;  // Proportional gain for angular control
+    cmd_vel.angular.z = Kp_angular * angle_diff;
+    
+    // Limit angular velocity without using std::clamp
+    const double MAX_ANGULAR_SPEED = 1.0;
+    if (cmd_vel.angular.z > MAX_ANGULAR_SPEED) {
+        cmd_vel.angular.z = MAX_ANGULAR_SPEED;
+    } else if (cmd_vel.angular.z < -MAX_ANGULAR_SPEED) {
+        cmd_vel.angular.z = -MAX_ANGULAR_SPEED;
+    }
+
+    // Calculate linear velocity based on angle error
+    // The robot moves faster when aligned with the target
+    const double MAX_LINEAR_SPEED = 0.5;
+    cmd_vel.linear.x = MAX_LINEAR_SPEED * (1.0 - std::min(1.0, std::abs(angle_diff) / M_PI));
+
+    robot_publishers[robot_id]->publish(cmd_vel);
+    return false;
+}
+
+void FleetController::reorganize_queue() {
+    // Sprawdź czy są dziury w kolejce
+    for (int i = 0; i < NUM_ROBOTS - 1; i++) {
+        if (robot_bases[i] == -1 && robot_bases[i + 1] != -1) {
+            // Jest dziura, przesuń roboty do przodu
+            int robot_id = robot_bases[i + 1];
+            if (!robots[robot_id].is_busy && robots[robot_id].state == RobotState::State::WAITING) {
+                // Przesuń robota na wolne miejsce
+                robot_bases[i] = robot_id;
+                robot_bases[i + 1] = -1;
+                // Wyślij robota na nową pozycję
+                move_straight(robot_id, get_queue_position(i));
+            }
+        }
+    }
+}
+
+void FleetController::control_loop() {
+    // Obsługa pierwszego robota w kolejce
+    if (!task_queue.empty() && robot_bases[0] != -1) {
+        int first_robot = robot_bases[0];
+        auto& robot = robots[first_robot];
+        
+        if (!robot.is_busy) {
+            // Przydziel nowe zadanie
+            robot.current_task = task_queue.front();
+            task_queue.pop();
+            robot.is_busy = true;
+            robot.state = RobotState::State::MOVING_TO_PICKUP;
+            robot_bases[0] = -1; // Zwolnij miejsce w kolejce
+            RCLCPP_INFO(this->get_logger(), 
+                "Assigned task to robot %d: pickup at (%d,%d), delivery at (%d,%d)",
+                first_robot, robot.current_task.pickup.x, robot.current_task.pickup.y,
+                robot.current_task.delivery.x, robot.current_task.delivery.y);
+        }
+    }
+
+    // Obsługa wszystkich robotów
+    for (int i = 0; i < NUM_ROBOTS; i++) {
+        auto& robot = robots[i];
+        
+        if (robot.is_busy) {
+            switch (robot.state) {
+                case RobotState::State::MOVING_TO_PICKUP:
+                    if (move_to_pickup(i)) {
+                        robot.state = RobotState::State::MOVING_TO_DELIVERY;
+                        RCLCPP_INFO(this->get_logger(), "Robot %d reached pickup point", i);
+                    }
+                    break;
+
+                case RobotState::State::MOVING_TO_DELIVERY:
+                    if (move_to_delivery(i)) {
+                        robot.state = RobotState::State::RETURNING_TO_QUEUE;
+                        RCLCPP_INFO(this->get_logger(), "Robot %d reached delivery point", i);
+                    }
+                    break;
+
+                case RobotState::State::RETURNING_TO_QUEUE:
+                    if (return_to_queue(i)) {
+                        robot.state = RobotState::State::WAITING;
+                        robot.is_busy = false;
+                        RCLCPP_INFO(this->get_logger(), "Robot %d returned to queue", i);
+                    }
+                    break;
+
+                case RobotState::State::WAITING:
+                    // Nic nie rób, robot czeka w kolejce
+                    break;
+            }
+        }
+    }
+
+    // Reorganizacja kolejki
+    //reorganize_queue();
+}
+
+bool FleetController::move_to_pickup(int robot_id) {
+    auto& robot = robots[robot_id];
+    static Point2D intermediate_point;
+
+    switch (robot.movement_phase) {
+        case 0:  // Obrót w lewo (90 stopni)
+            if (rotate_robot(robot_id, M_PI/2)) {
+                robot.movement_phase = 1;
+                intermediate_point = {robot.current_task.pickup.x, robot.current_position.y};
+            }
+            break;
+
+        case 1:  // Jazda do punktu X
+            if (move_straight(robot_id, intermediate_point)) {
+                robot.movement_phase = 2;
+            }
+            break;
+
+        case 2:  // Obrót w prawo (-90 stopni)
+            if (rotate_robot(robot_id, 0.0)) {
+                robot.movement_phase = 3;
+            }
+            break;
+
+        case 3:  // Jazda do punktu Y
+            if (move_straight(robot_id, robot.current_task.pickup)) {
+                robot.movement_phase = 0;  // Reset dla następnego użycia
+                return true;
+            }
+            break;
+    }
+
+    return false;
+}
+
+bool FleetController::move_to_delivery(int robot_id) {
+    auto& robot = robots[robot_id];
+    static Point2D intermediate_point;
+
+    switch (robot.movement_phase) {
+        case 0:  // Pierwszy obrót o 90 stopni
+            if (rotate_robot(robot_id, M_PI/2)) {
+                robot.movement_phase = 1;
+            }
+            break;
+
+        case 1:  // Drugi obrót o 90 stopni
+            if (rotate_robot(robot_id, M_PI)) {
+                robot.movement_phase = 2;
+                intermediate_point = {robot.current_position.x, 0};  // Punkt z Y=0
+            }
+            break;
+
+        case 2:  // Jazda do Y=0
+            if (move_straight(robot_id, intermediate_point)) {
+                robot.movement_phase = 3;
+            }
+            break;
+
+        case 3:  // Obrót w kierunku X punktu docelowego
+            {
+                double target_angle = (robot.current_task.delivery.x > robot.current_position.x) ? 0.0 : M_PI;
+                if (rotate_robot(robot_id, target_angle)) {
+                    robot.movement_phase = 4;
+                    intermediate_point = {robot.current_task.delivery.x, robot.current_position.y};
+                }
+            }
+            break;
+
+        case 4:  // Jazda do odpowiedniego X
+            if (move_straight(robot_id, intermediate_point)) {
+                robot.movement_phase = 5;
+            }
+            break;
+
+        case 5:  // Obrót w kierunku punktu docelowego
+            {
+                double target_angle = (robot.current_task.delivery.y > robot.current_position.y) ? M_PI/2 : -M_PI/2;
+                if (rotate_robot(robot_id, target_angle)) {
+                    robot.movement_phase = 6;
+                }
+            }
+            break;
+
+        case 6:  // Jazda do punktu docelowego
+            if (move_straight(robot_id, robot.current_task.delivery)) {
+                robot.movement_phase = 0;  // Reset dla następnego użycia
+                return true;
+            }
+            break;
+    }
+
+    return false;
+}
+
+bool FleetController::return_to_queue(int robot_id) {
+    auto& robot = robots[robot_id];
+    static Point2D intermediate_point;
+    static int target_queue_position = -1;
+
+    switch (robot.movement_phase) {
+        case 0:  // Pierwszy obrót o 90 stopni
+            if (rotate_robot(robot_id, M_PI/2)) {
+                robot.movement_phase = 1;
+            }
+            break;
+
+        case 1:  // Drugi obrót o 90 stopni
+            if (rotate_robot(robot_id, M_PI)) {
+                robot.movement_phase = 2;
+                intermediate_point = {robot.current_position.x, get_queue_position(NUM_ROBOTS-1).y};
+            }
+            break;
+
+        case 2:  // Jazda do Y ostatniego miejsca w kolejce
+            if (move_straight(robot_id, intermediate_point)) {
+                robot.movement_phase = 3;
+            }
+            break;
+
+        case 3:  // Obrót w prawo
+            if (rotate_robot(robot_id, M_PI/2)) {
+                robot.movement_phase = 4;
+                intermediate_point = {-8, robot.current_position.y};
+            }
+            break;
+
+        case 4:  // Jazda do X kolejki
+            if (move_straight(robot_id, intermediate_point)) {
+                robot.movement_phase = 5;
+            }
+            break;
+
+        case 5:  // Obrót w lewo (ustawienie jak w kolejce)
+            if (rotate_robot(robot_id, 0.0)) {
+                robot.movement_phase = 6;
+                target_queue_position = find_first_empty_queue_position();
+                if (target_queue_position != -1) {
+                    intermediate_point = get_queue_position(target_queue_position);
+                }
+            }
+            break;
+
+        case 6:  // Jazda do wolnego miejsca w kolejce
+            if (target_queue_position != -1 && move_straight(robot_id, intermediate_point)) {
+                robot_bases[target_queue_position] = robot_id;
+                robot.movement_phase = 0;  // Reset dla następnego użycia
+                return true;
+            }
+            break;
+    }
+
+    return false;
+}

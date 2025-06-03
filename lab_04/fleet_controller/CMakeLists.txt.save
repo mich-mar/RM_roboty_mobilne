@@ -1,0 +1,138 @@
+#include "fleet_controller.hpp"
+
+FleetController::FleetController() 
+    : Node("fleet_controller"), 
+      gen(rd()), 
+      dis(1, 10) {
+    
+    // Inicjalizacja robotów
+    for (int i = 0; i < 16; ++i) {
+        Robot robot;
+        robot.id = i;
+        robot.current_position = bazy_pojazdów[i];
+        robot.is_busy = false;
+        robot.namespace_name = "tb_" + std::to_string(i);
+        robots.push_back(robot);
+        
+        // Utworzenie publisherów dla każdego robota
+        auto pub = this->create_publisher<geometry_msgs::msg::Twist>(
+            robot.namespace_name + "/cmd_vel", 10);
+        robot_publishers.push_back(pub);
+        
+        // Utworzenie subscriberów odometrii
+        auto sub = this->create_subscription<nav_msgs::msg::Odometry>(
+            robot.namespace_name + "/odom",
+            10,
+            [this, i](nav_msgs::msg::Odometry::SharedPtr msg) {
+                this->odom_callback(msg, i);
+            });
+        odom_subscribers.push_back(sub);
+    }
+    
+    // Subscriber dla nowych zadań
+    task_subscriber = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+        "new_task",
+        10,
+        std::bind(&FleetController::task_callback, this, std::placeholders::_1));
+        
+    // Timer do przydzielania zadań (co 100ms)
+    timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&FleetController::assign_tasks, this));
+}
+
+void FleetController::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg, int robot_id) {
+    if (robot_id >= 0 && robot_id < robots.size()) {
+        robots[robot_id].current_pose = msg->pose.pose;
+        // Aktualizacja pozycji na siatce
+        robots[robot_id].current_position.x = static_cast<int>(std::round(msg->pose.pose.position.x));
+        robots[robot_id].current_position.y = static_cast<int>(std::round(msg->pose.pose.position.y));
+    }
+}
+
+void FleetController::task_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
+    if (msg->data.size() >= 2) {
+        Task new_task;
+        new_task.pickup_point = msg->data[0] == 0 ? get_random_point() : msg->data[0];
+        new_task.delivery_point = msg->data[1] == 0 ? get_random_point() : msg->data[1];
+        new_task.assigned_robot = -1;
+        task_queue.push(new_task);
+        RCLCPP_INFO(this->get_logger(), "Nowe zadanie: odbiór z %d, dostawa do %d", 
+                    new_task.pickup_point, new_task.delivery_point);
+    }
+}
+
+void FleetController::assign_tasks() {
+    if (task_queue.empty()) return;
+
+    // Sprawdź pierwszego wolnego robota w kolejce
+    for (auto& robot : robots) {
+        if (!robot.is_busy) {
+            Task& current_task = task_queue.front();
+            current_task.assigned_robot = robot.id;
+            robot.is_busy = true;
+
+            // Najpierw jedź do punktu odbioru
+            Point2D pickup = get_point_coordinates(current_task.pickup_point, true);
+            move_robot(robot.id, pickup);
+            
+            task_queue.pop();
+            rotate_robot_queue();
+            break;
+        }
+    }
+}
+
+void FleetController::move_robot(int robot_id, const Point2D& target) {
+    if (robot_id >= robots.size()) return;
+
+    auto& robot = robots[robot_id];
+    geometry_msgs::msg::Twist cmd_vel;
+
+    // Oblicz różnicę pozycji
+    double dx = target.x - robot.current_position.x;
+    double dy = target.y - robot.current_position.y;
+
+    // Ustal prędkość (najpierw ruch w osi X, potem w osi Y)
+    if (std::abs(dx) > 0.1) {
+        cmd_vel.linear.x = (dx > 0) ? 0.2 : -0.2;
+    } else if (std::abs(dy) > 0.1) {
+        cmd_vel.linear.y = (dy > 0) ? 0.2 : -0.2;
+    } else {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.linear.y = 0.0;
+    }
+
+    robot_publishers[robot_id]->publish(cmd_vel);
+}
+
+void FleetController::rotate_robot_queue() {
+    if (robots.empty()) return;
+    
+    Robot temp = robots.front();
+    robots.erase(robots.begin());
+    robots.push_back(temp);
+}
+
+Point2D FleetController::get_point_coordinates(int point_number, bool is_pickup) {
+    if (point_number < 1 || point_number > 10) return {0, 0};
+    
+    if (is_pickup) {
+        return stanowiska_odbioru[point_number - 1];
+    } else {
+        return stanowiska_docelowe[point_number - 1];
+    }
+}
+
+double FleetController::calculate_manhattan_distance(const Point2D& p1, const Point2D& p2) {
+    return std::abs(p1.x - p2.x) + std::abs(p1.y - p2.y);
+}
+
+int FleetController::get_random_point(int min, int max) {
+    return dis(gen);
+}
+
+bool FleetController::is_robot_at_point(const Robot& robot, const Point2D& point) {
+    return (std::abs(robot.current_position.x - point.x) < 0.1 &&
+            std::abs(robot.current_position.y - point.y) < 0.1);
+}
