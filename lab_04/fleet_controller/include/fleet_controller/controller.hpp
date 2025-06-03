@@ -14,12 +14,12 @@ public:
 
 private:
     // Stałe
-    static const int NUM_ROBOTS = 16;
-    static constexpr double LINEAR_SPEED = 0.2;
-    static constexpr double ANGULAR_SPEED = 0.5;
-    static constexpr double POSITION_TOLERANCE = 0.1;
-    static constexpr double ANGLE_TOLERANCE = 0.05;
-    static constexpr double COURSE_CHECK_DISTANCE = 0.5; // Co pół kratki sprawdzaj kurs
+    int NUM_ROBOTS = 16;
+    double LINEAR_SPEED = 0.2;
+    double ANGULAR_SPEED = 0.5;
+    double POSITION_TOLERANCE = 0.01;
+    double ANGLE_TOLERANCE = 0.05;
+    double COURSE_CHECK_DISTANCE = 0.5;
 
     // Struktury danych
     struct Task {
@@ -33,7 +33,7 @@ private:
     std::queue<Task> task_queue;
 
     // Kolejka robotów (-1 oznacza puste miejsce)
-    std::vector<int> robot_bases;
+    std::vector<int> queue_state;
 
     // Publishers i Subscribers
     std::vector<rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr> robot_publishers;
@@ -50,6 +50,9 @@ private:
     bool is_busy;
     Task current_task;
     int movement_phase;
+    double desired_heading = 0.0;  // Pożądany kąt kursu
+    double last_heading_error = 0.0;
+    double heading_error_integral = 0.0;
     enum class State {
         WAITING,
         MOVING_TO_PICKUP,
@@ -77,6 +80,12 @@ private:
     double get_robot_yaw(const geometry_msgs::msg::Pose& pose);
     Point2D get_queue_position(int queue_position);
     int find_first_empty_queue_position();
+
+    double calculate_heading_to_target(const Point2D& current, const Point2D& target) {
+        double dx = target.x - current.x;
+        double dy = target.y - current.y;
+        return std::atan2(dy, dx);
+    }
 };
 
 #endif  // FLEET_CONTROLLER_CONTROLLER_HPP_

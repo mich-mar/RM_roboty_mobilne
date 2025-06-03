@@ -5,15 +5,18 @@
 
 FleetController::FleetController() : Node("fleet_controller") {
     // Inicjalizacja kolejki robotów
-    queue_state.resize(NUM_ROBOTS, -1);
+    robot_bases.resize(NUM_ROBOTS, -1);
     robots.resize(NUM_ROBOTS);
 
     // Na początku wszystkie roboty są w kolejce
     for (int i = 0; i < NUM_ROBOTS; ++i) {
-        queue_state[i] = i;
+        queue_state[i] = i;              // było: robot_bases[i] = i
         robots[i].is_busy = false;
         robots[i].state = RobotState::State::WAITING;
         robots[i].movement_phase = 0;
+        robots[i].is_busy = false;
+        robots[i].state = RobotState::State::WAITING;
+	robots[i].movement_phase = 0;
     }
 
     // Publishers i subscribers dla każdego robota
@@ -91,9 +94,13 @@ bool FleetController::is_point_reached(const Point2D& current, const Point2D& ta
             std::abs(current.y - target.y) < POSITION_TOLERANCE);
 }
 
+Point2D FleetController::get_queue_position(int queue_position) {
+    return {-8, -8 + queue_position};  // Kolejka wzdłuż lewej ściany
+}
+
 int FleetController::find_first_empty_queue_position() {
     for (int i = 0; i < NUM_ROBOTS; ++i) {
-        if (queue_state[i] == -1) {
+        if (robot_bases[i] == -1) {
             return i;
         }
     }
@@ -147,7 +154,6 @@ bool FleetController::move_straight(int robot_id, const Point2D& target) {
     auto& robot = robots[robot_id];
     geometry_msgs::msg::Twist cmd_vel;
 
-    // Zero all velocities
     cmd_vel.linear.x = 0.0;
     cmd_vel.linear.y = 0.0;
     cmd_vel.linear.z = 0.0;
@@ -155,64 +161,56 @@ bool FleetController::move_straight(int robot_id, const Point2D& target) {
     cmd_vel.angular.y = 0.0;
     cmd_vel.angular.z = 0.0;
 
-    // Calculate distance to target
+
+    // Oblicz odległość do celu
     double dx = target.x - robot.current_position.x;
     double dy = target.y - robot.current_position.y;
     double distance = std::sqrt(dx * dx + dy * dy);
     
-    // If we reached the target, stop and return true
+    // Jeśli dotarliśmy do celu, zatrzymaj robota
     if (distance < POSITION_TOLERANCE) {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = 0.0;
         robot_publishers[robot_id]->publish(cmd_vel);
-        // Reset PID errors when reaching target
-        robot.last_heading_error = 0.0;
-        robot.heading_error_integral = 0.0;
         return true;
     }
 
-    // Calculate desired heading to target
-    double desired_heading = atan2(dy, dx);
+    // Oblicz pożądany heading (kurs) do celu
+    double desired_heading = calculate_heading_to_target(robot.current_position, target);
+    
+    // Pobierz aktualny heading robota
     double current_heading = get_robot_yaw(robot.current_pose);
+    
+    // Oblicz błąd kursu
     double heading_error = desired_heading - current_heading;
     
-    // Normalize heading error to [-π, π]
+    // Normalizuj błąd do zakresu [-π, π]
     while (heading_error > M_PI) heading_error -= 2 * M_PI;
     while (heading_error < -M_PI) heading_error += 2 * M_PI;
 
-    // PID dla kontroli kąta
-    double Kp = 0.5;  // Proportional gain (możesz dostosować)
-    double Ki = 0.01; // Integral gain (możesz dostosować)
-    double Kd = 0.1;  // Derivative gain (możesz dostosować)
-    double dt = 0.1;  // Zakładając, że control_loop działa co 100ms
-    double WIDER_ANGLE_TOLERANCE = 0.15; // Około 8.6 stopni
+    // Parametry kontrolera
+    const double Kp_angular = 1.0;  // Współczynnik proporcjonalny dla kontroli kąta
+    const double MAX_ANGULAR_SPEED = 1.0;
+    const double MAX_LINEAR_SPEED = 0.5;
+    const double MIN_LINEAR_SPEED = 0.1;
+    const double HEADING_TOLERANCE = 0.1;  // Tolerancja błędu kursu (w radianach)
 
-    // Obliczenie członu całkującego (integral)
-    robot.heading_error_integral += heading_error * dt;
-    // Ograniczenie członu całkującego aby zapobiec wind-up
-    double MAX_INTEGRAL = 1.0;
-    robot.heading_error_integral = std::max(-MAX_INTEGRAL, 
-                                          std::min(MAX_INTEGRAL, robot.heading_error_integral));
-
-    // Obliczenie członu różniczkującego (derivative)
-    double heading_error_derivative = (heading_error - robot.last_heading_error) / dt;
-    robot.last_heading_error = heading_error;
-
-    // Obliczenie sterowania PID
-    double angular_control = Kp * heading_error + 
-                           Ki * robot.heading_error_integral +
-                           Kd * heading_error_derivative;
-
-    // Jeśli robot nie jest skierowany w stronę celu, obróć go
-    if (std::abs(heading_error) > WIDER_ANGLE_TOLERANCE) {
-        // Tylko obrót z PID
-        cmd_vel.angular.z = std::max(-ANGULAR_SPEED, 
-                                   std::min(ANGULAR_SPEED, angular_control));
-    } else {
-        // Jeśli robot jest w miarę skierowany w dobrą stronę, 
-        // jedź do przodu z delikatną korektą kąta
-        cmd_vel.linear.x = LINEAR_SPEED;
-        cmd_vel.angular.z = angular_control * 0.5; // Zmniejszone sterowanie kątem podczas jazdy
+    // Oblicz prędkość kątową (obrót)
+    cmd_vel.angular.z = Kp_angular * heading_error;
+    
+    // Ogranicz prędkość kątową
+    if (cmd_vel.angular.z > MAX_ANGULAR_SPEED) {
+        cmd_vel.angular.z = MAX_ANGULAR_SPEED;
+    } else if (cmd_vel.angular.z < -MAX_ANGULAR_SPEED) {
+        cmd_vel.angular.z = -MAX_ANGULAR_SPEED;
     }
 
+    // Oblicz prędkość liniową w zależności od błędu kursu
+    double heading_factor = 1.0 - std::min(1.0, std::abs(heading_error) / M_PI);
+    cmd_vel.linear.x = MIN_LINEAR_SPEED + 
+                      (MAX_LINEAR_SPEED - MIN_LINEAR_SPEED) * heading_factor;
+
+    // Opublikuj komendę prędkości
     robot_publishers[robot_id]->publish(cmd_vel);
     return false;
 }
@@ -220,15 +218,15 @@ bool FleetController::move_straight(int robot_id, const Point2D& target) {
 void FleetController::reorganize_queue() {
     // Sprawdź czy są dziury w kolejce
     for (int i = 0; i < NUM_ROBOTS - 1; i++) {
-        if (queue_state[i] == -1 && queue_state[i + 1] != -1) {
+        if (robot_bases[i] == -1 && robot_bases[i + 1] != -1) {
             // Jest dziura, przesuń roboty do przodu
-            int robot_id = queue_state[i + 1];
+            int robot_id = robot_bases[i + 1];
             if (!robots[robot_id].is_busy && robots[robot_id].state == RobotState::State::WAITING) {
                 // Przesuń robota na wolne miejsce
-                queue_state[i] = robot_id;
-                queue_state[i + 1] = -1;
+                robot_bases[i] = robot_id;
+                robot_bases[i + 1] = -1;
                 // Wyślij robota na nową pozycję
-                move_straight(robot_id, robot_bases[i]);
+                move_straight(robot_id, get_queue_position(i));
             }
         }
     }
@@ -236,8 +234,8 @@ void FleetController::reorganize_queue() {
 
 void FleetController::control_loop() {
     // Obsługa pierwszego robota w kolejce
-    if (!task_queue.empty() && queue_state[0] != -1) {
-        int first_robot = queue_state[0];
+    if (!task_queue.empty() && robot_bases[0] != -1) {
+        int first_robot = robot_bases[0];
         auto& robot = robots[first_robot];
         
         if (!robot.is_busy) {
@@ -246,7 +244,7 @@ void FleetController::control_loop() {
             task_queue.pop();
             robot.is_busy = true;
             robot.state = RobotState::State::MOVING_TO_PICKUP;
-            queue_state[0] = -1; // Zwolnij miejsce w kolejce
+            robot_bases[0] = -1; // Zwolnij miejsce w kolejce
             RCLCPP_INFO(this->get_logger(), 
                 "Assigned task to robot %d: pickup at (%d,%d), delivery at (%d,%d)",
                 first_robot, robot.current_task.pickup.x, robot.current_task.pickup.y,
@@ -336,7 +334,6 @@ bool FleetController::move_to_delivery(int robot_id) {
         case 0:  // Pierwszy obrót o 180 stopni
             if (rotate_robot(robot_id, M_PI/2)) {
                 robot.movement_phase = 1;
-                intermediate_point = {robot.current_task.pickup.x, 0};
             }
             break;
 
@@ -390,7 +387,7 @@ bool FleetController::return_to_queue(int robot_id) {
         case 0:  // Pierwszy obrót o 90 stopni
             if (rotate_robot(robot_id, -M_PI/2)) {
                 robot.movement_phase = 1;
-		intermediate_point = {robot.current_task.delivery.x, robot_bases[15].y};
+		intermediate_point = {robot.current_task.delivery.x, 7};
             }
             break;
 
@@ -403,28 +400,29 @@ bool FleetController::return_to_queue(int robot_id) {
         case 2:  // Obrót w prawo
             if (rotate_robot(robot_id, M_PI)) {
                 robot.movement_phase = 3;
+                intermediate_point = {-8, robot.current_position.y};
             }
             break;
 
-        case 3:  // Jazda do X kolejki
-            if (move_straight(robot_id, robot_bases[15])) {
+        case 4:  // Jazda do X kolejki
+            if (move_straight(robot_id, intermediate_point)) {
                 robot.movement_phase = 4;
             }
             break;
 
-        case 4:  // Obrót w lewo (ustawienie jak w kolejce)
+        case 5:  // Obrót w lewo (ustawienie jak w kolejce)
             if (rotate_robot(robot_id, -M_PI/2)) {
-                robot.movement_phase = 5;
+                robot.movement_phase = 6;
                 target_queue_position = find_first_empty_queue_position();
                 if (target_queue_position != -1) {
-                    intermediate_point = robot_bases[target_queue_position];
+                    intermediate_point = get_queue_position(target_queue_position);
                 }
             }
             break;
 
-        case 5:  // Jazda do wolnego miejsca w kolejce
+        case 6:  // Jazda do wolnego miejsca w kolejce
             if (target_queue_position != -1 && move_straight(robot_id, intermediate_point)) {
-                queue_state[target_queue_position] = robot_id;
+                robot_bases[target_queue_position] = robot_id;
                 robot.movement_phase = 0;  // Reset dla następnego użycia
                 return true;
             }
