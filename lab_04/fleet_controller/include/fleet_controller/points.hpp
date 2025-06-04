@@ -2,8 +2,8 @@
 #define POINTS_HPP
 
 struct Point2D {
-    int x;
-    int y;
+    double x;
+    double y;
 };
 
 // Robot bases: points from (-8, -8) to (-8, 7)
